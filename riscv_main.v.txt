@@ -1,0 +1,205 @@
+Verilog HDL Source Code — risc_4stage.v
+verilog
+// ============================================================
+//  4-Stage RISC Processor
+//  Stages: IF -> ID -> EX -> WB
+//  Instruction format (32-bit):
+//    [31:28] opcode  [27:23] rd  [22:18] rs1  [17:13] rs2  [12:0] imm
+//
+//  Opcodes:
+//    4'h0 = NOP
+//    4'h1 = ADD   rd = rs1 + rs2
+//    4'h2 = SUB   rd = rs1 - rs2
+//    4'h3 = AND   rd = rs1 & rs2
+//    4'h4 = OR    rd = rs1 | rs2
+//    4'h5 = LOAD  rd = rs1 + imm
+//    4'h6 = STORE addr = rs1 + imm
+// ============================================================
+
+module risc4stage (
+    input  wire        clk,
+    input  wire        reset,
+    output wire [31:0] dbg_A,
+    output wire [31:0] dbg_B,
+    output wire [31:0] dbg_instr,
+    output wire [3:0]  dbg_pc,
+    output wire [3:0]  dbg_rd,
+    output wire [31:0] dbg_result,
+    output wire [3:0]  EX_WB_rd,
+    output wire [31:0] EX_WB_result,
+    output wire [31:0] ID_EX_A,
+    output wire [31:0] ID_EX_B,
+    output wire [3:0]  ID_EX_opcode,
+    output wire [3:0]  ID_EX_rd,
+    output wire [31:0] IF_ID_instr,
+    output wire        i,
+    output wire [3:0]  opcode,
+    output wire [3:0]  pc,
+    output wire [4:0]  rd,
+    output wire        reset_out,
+    output wire [4:0]  rs1,
+    output wire [4:0]  rs2
+);
+
+    // ----------------------------------------------------------------
+    // Instruction Memory (16 x 32 bits)
+    // ----------------------------------------------------------------
+    reg [31:0] instr_mem [0:15];
+
+    // ----------------------------------------------------------------
+    // Register File (32 x 32 bits)
+    // ----------------------------------------------------------------
+    reg [31:0] regfile [0:31];
+
+    // ----------------------------------------------------------------
+    // Pipeline Registers
+    // ----------------------------------------------------------------
+    reg [31:0] IF_ID_instr_r;
+    reg [3:0]  IF_ID_pc_r;
+
+    reg [31:0] ID_EX_A_r;
+    reg [31:0] ID_EX_B_r;
+    reg [3:0]  ID_EX_opcode_r;
+    reg [4:0]  ID_EX_rd_r;
+    reg [12:0] ID_EX_imm_r;
+    reg        ID_EX_i_r;
+
+    reg [31:0] EX_WB_result_r;
+    reg [4:0]  EX_WB_rd_r;
+    reg        EX_WB_we_r;
+
+    reg [3:0]  pc_r;
+
+    // ----------------------------------------------------------------
+    // Output Assignments
+    // ----------------------------------------------------------------
+    assign pc           = pc_r;
+    assign IF_ID_instr  = IF_ID_instr_r;
+    assign ID_EX_A      = ID_EX_A_r;
+    assign ID_EX_B      = ID_EX_B_r;
+    assign ID_EX_opcode = ID_EX_opcode_r;
+    assign ID_EX_rd     = ID_EX_rd_r[3:0];
+    assign EX_WB_result = EX_WB_result_r;
+    assign EX_WB_rd     = EX_WB_rd_r[3:0];
+    assign i            = ID_EX_i_r;
+    assign reset_out    = reset;
+
+    assign opcode = IF_ID_instr_r[31:28];
+    assign rd     = IF_ID_instr_r[27:23];
+    assign rs1    = IF_ID_instr_r[22:18];
+    assign rs2    = IF_ID_instr_r[17:13];
+
+    assign dbg_A      = ID_EX_A_r;
+    assign dbg_B      = ID_EX_B_r;
+    assign dbg_instr  = IF_ID_instr_r;
+    assign dbg_pc     = IF_ID_pc_r;
+    assign dbg_rd     = EX_WB_rd_r[3:0];
+    assign dbg_result = EX_WB_result_r;
+
+    // ----------------------------------------------------------------
+    // Instruction Memory and Register File Initialisation
+    // ----------------------------------------------------------------
+    integer k;
+    initial begin
+        for (k = 0; k < 16; k = k + 1)
+            instr_mem[k] = 32'h0000_0000;
+
+        for (k = 0; k < 32; k = k + 1)
+            regfile[k] = 32'h0000_0000;
+        regfile[1]  = 32'h0000_0001;  // r1 = 1
+        regfile[2]  = 32'h0000_0005;  // r2 = 5
+        regfile[3]  = 32'h0000_0003;  // r3 = 3
+        regfile[4]  = 32'h0000_0004;  // r4 = 4
+        regfile[5]  = 32'h0000_000A;  // r5 = 10
+    end
+
+    // ----------------------------------------------------------------
+    // Pipeline Logic
+    // ----------------------------------------------------------------
+    integer j;
+    always @(posedge clk or posedge reset) begin
+        if (reset) begin
+            pc_r            <= 4'h0;
+            IF_ID_instr_r   <= 32'h0;
+            IF_ID_pc_r      <= 4'h0;
+            ID_EX_A_r       <= 32'h0;
+            ID_EX_B_r       <= 32'h0;
+            ID_EX_opcode_r  <= 4'h0;
+            ID_EX_rd_r      <= 5'h0;
+            ID_EX_imm_r     <= 13'h0;
+            ID_EX_i_r       <= 1'b0;
+            EX_WB_result_r  <= 32'h0;
+            EX_WB_rd_r      <= 5'h0;
+            EX_WB_we_r      <= 1'b0;
+            // NOTE: regfile is NOT reset here intentionally.
+            // Values set in the initial block are preserved.
+        end else begin
+
+            // ---- WB Stage ----------------------------------------
+            if (EX_WB_we_r && (EX_WB_rd_r != 5'h0))
+                regfile[EX_WB_rd_r] <= EX_WB_result_r;
+
+            // ---- EX Stage ----------------------------------------
+            begin : EX
+                reg [31:0] alu_out;
+                reg        we;
+                we      = 1'b0;
+                alu_out = 32'h0;
+                case (ID_EX_opcode_r)
+                    4'h0: begin alu_out = 32'h0;                  we = 1'b0; end
+                    4'h1: begin alu_out = ID_EX_A_r + ID_EX_B_r; we = 1'b1; end
+                    4'h2: begin alu_out = ID_EX_A_r - ID_EX_B_r; we = 1'b1; end
+                    4'h3: begin alu_out = ID_EX_A_r & ID_EX_B_r; we = 1'b1; end
+                    4'h4: begin alu_out = ID_EX_A_r | ID_EX_B_r; we = 1'b1; end
+                    4'h5: begin alu_out = ID_EX_A_r + 
+                                {{19{ID_EX_imm_r[12]}}, ID_EX_imm_r}; 
+                                we = 1'b1; end
+                    4'h6: begin alu_out = ID_EX_A_r + 
+                                {{19{ID_EX_imm_r[12]}}, ID_EX_imm_r}; 
+                                we = 1'b0; end
+                    default: begin alu_out = 32'h0; we = 1'b0; end
+                endcase
+                EX_WB_result_r <= alu_out;
+                EX_WB_rd_r     <= ID_EX_rd_r;
+                EX_WB_we_r     <= we;
+            end
+
+            // ---- ID Stage ----------------------------------------
+            begin : ID
+                reg [3:0]  id_op;
+                reg [4:0]  id_rd, id_rs1, id_rs2;
+                reg [12:0] id_imm;
+                id_op  = IF_ID_instr_r[31:28];
+                id_rd  = IF_ID_instr_r[27:23];
+                id_rs1 = IF_ID_instr_r[22:18];
+                id_rs2 = IF_ID_instr_r[17:13];
+                id_imm = IF_ID_instr_r[12:0];
+                ID_EX_A_r      <= regfile[id_rs1];
+                ID_EX_B_r      <= regfile[id_rs2];
+                ID_EX_opcode_r <= id_op;
+                ID_EX_rd_r     <= id_rd;
+                ID_EX_imm_r    <= id_imm;
+                ID_EX_i_r      <= (id_op == 4'h5 || 
+                                   id_op == 4'h6) ? id_imm[12] : 1'b0;
+            end
+
+            // ---- IF Stage ----------------------------------------
+            IF_ID_instr_r <= instr_mem[pc_r];
+            IF_ID_pc_r    <= pc_r;
+            pc_r          <= pc_r + 4'h1;
+        end
+    end
+
+    // ----------------------------------------------------------------
+    // Task: load one instruction word (called from testbench)
+    // ----------------------------------------------------------------
+    task load_instr;
+        input [3:0]  addr;
+        input [31:0] instr;
+        begin
+            instr_mem[addr] = instr;
+        end
+    endtask
+
+endmodule
+
